@@ -458,6 +458,95 @@ echo "Note: User data in ~/.{INSTALL_CONFIG['app_name'].lower()} was preserved."
         return True  # Not critical
 
 
+def check_system_requirements():
+    """Check system requirements and dependencies."""
+    log_message("Checking system requirements...")
+    
+    requirements_met = True
+    
+    # Check available disk space
+    try:
+        import shutil
+        free_space = shutil.disk_usage(Path.home()).free
+        required_space = 200 * 1024 * 1024  # 200MB
+        
+        if free_space < required_space:
+            log_message(f"Insufficient disk space. Required: 200MB, Available: {free_space // (1024*1024)}MB", "ERROR")
+            requirements_met = False
+        else:
+            log_message(f"Disk space check passed: {free_space // (1024*1024)}MB available")
+    except Exception:
+        log_message("Could not check disk space", "WARNING")
+    
+    # Check for required system libraries on Linux
+    if platform.system() == "Linux":
+        required_libs = ["libxcb", "libx11", "libgl"]
+        missing_libs = []
+        
+        for lib in required_libs:
+            try:
+                result = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True)
+                if lib not in result.stdout:
+                    missing_libs.append(lib)
+            except:
+                log_message("Could not check system libraries", "WARNING")
+                break
+        
+        if missing_libs:
+            log_message(f"Missing system libraries: {', '.join(missing_libs)}", "WARNING")
+            log_message("Install with: sudo apt-get install libxcb1 libx11-6 libgl1-mesa-glx", "INFO")
+    
+    return requirements_met
+
+
+def create_requirements_file(install_path: Path):
+    """Create requirements.txt file with installed packages."""
+    log_message("Creating requirements file...")
+    
+    requirements_content = "\n".join(INSTALL_CONFIG["required_packages"] + INSTALL_CONFIG["optional_packages"])
+    
+    try:
+        requirements_path = install_path / "requirements.txt"
+        with open(requirements_path, "w") as f:
+            f.write(requirements_content)
+        
+        log_message(f"Requirements file created: {requirements_path}")
+        return True
+    except OSError as e:
+        log_message(f"Failed to create requirements file: {e}", "WARNING")
+        return True  # Not critical
+
+
+def register_installation():
+    """Register installation in system (for uninstall tracking)."""
+    log_message("Registering installation...")
+    
+    try:
+        if platform.system() == "Windows":
+            # Register in Windows registry (requires admin privileges)
+            log_message("Windows registry registration requires admin privileges", "INFO")
+        else:
+            # Create registration file in user directory
+            install_info = {
+                "app_name": INSTALL_CONFIG["app_name"],
+                "version": INSTALL_CONFIG["version"],
+                "install_date": datetime.now().isoformat(),
+                "install_path": str(Path.cwd()),
+                "python_version": sys.version
+            }
+            
+            reg_dir = Path.home() / ".local" / "share" / "applications"
+            reg_dir.mkdir(parents=True, exist_ok=True)
+            
+            reg_file = reg_dir / f".{INSTALL_CONFIG['app_name'].lower()}_install.json"
+            with open(reg_file, "w") as f:
+                json.dump(install_info, f, indent=2)
+            
+            log_message("Installation registered")
+    except Exception as e:
+        log_message(f"Failed to register installation: {e}", "WARNING")
+
+
 def print_installation_summary(install_path: Path, venv_path: Path = None):
     """Print installation summary."""
     print("\n" + "="*60)
@@ -482,6 +571,12 @@ def print_installation_summary(install_path: Path, venv_path: Path = None):
     uninstaller = "uninstall.bat" if platform.system() == "Windows" else "uninstall.sh"
     print(f"  Run: {install_path / uninstaller}")
     print()
+    print("Configuration and data will be stored in:")
+    print(f"  {install_path / 'data'}")
+    print()
+    print("For support and documentation, visit:")
+    print("  https://github.com/expense-tracker/expense-tracker")
+    print()
     print("Enjoy using the application!")
     print("="*60)
 
@@ -499,6 +594,8 @@ def main():
                        help="Skip optional packages")
     parser.add_argument("--source-dir", type=Path, default=".",
                        help="Source directory (default: current directory)")
+    parser.add_argument("--force", action="store_true",
+                       help="Force installation even if requirements not met")
     
     args = parser.parse_args()
     
@@ -512,9 +609,96 @@ def main():
         if not check_pip_available():
             return 1
         
+        if not args.force:
+            if not check_system_requirements():
+                log_message("System requirements not met. Use --force to continue anyway.", "ERROR")
+                return 1
+        
         # Determine installation directory
         if args.install_dir:
             install_path = args.install_dir
         elif args.system_install:
             if platform.system() == "Windows":
-                install_path = Path("C:/Program Files") /
+                install_path = Path("C:/Program Files") / INSTALL_CONFIG['app_name']
+            else:
+                install_path = Path("/opt") / INSTALL_CONFIG['app_name'].lower()
+        else:
+            install_path = Path.home() / INSTALL_CONFIG['app_name']
+        
+        # Check if already installed
+        if install_path.exists() and any(install_path.iterdir()):
+            response = input(f"Installation directory {install_path} already exists. Continue? (y/N): ")
+            if response.lower() != 'y':
+                log_message("Installation cancelled by user")
+                return 0
+        
+        # Create installation directory
+        install_path.mkdir(parents=True, exist_ok=True)
+        log_message(f"Installation directory: {install_path}")
+        
+        # Set up virtual environment if requested
+        venv_path = None
+        if args.use_venv:
+            venv_path = install_path / "venv"
+            if not create_virtual_environment(venv_path):
+                return 1
+        
+        # Install required packages
+        if not install_packages(INSTALL_CONFIG["required_packages"], venv_path):
+            return 1
+        
+        # Install optional packages
+        if not args.no_optional:
+            install_packages(INSTALL_CONFIG["optional_packages"], venv_path, optional=True)
+        
+        # Copy application files
+        if not copy_application_files(args.source_dir, install_path):
+            return 1
+        
+        # Create application directories
+        if not create_app_directories(install_path):
+            return 1
+        
+        # Create default configuration
+        if not create_default_config(install_path):
+            return 1
+        
+        # Create requirements file
+        create_requirements_file(install_path)
+        
+        # Create launcher scripts
+        if not create_launcher_scripts(install_path, venv_path):
+            return 1
+        
+        # Create desktop entry (Linux only)
+        create_desktop_entry(install_path)
+        
+        # Create uninstaller
+        create_uninstaller(install_path, venv_path)
+        
+        # Register installation
+        register_installation()
+        
+        # Verify installation
+        if not verify_installation(install_path, venv_path):
+            return 1
+        
+        # Print summary
+        print_installation_summary(install_path, venv_path)
+        
+        return 0
+        
+    except KeyboardInterrupt:
+        log_message("Installation cancelled by user", "WARNING")
+        return 1
+    except PermissionError as e:
+        log_message(f"Permission denied: {e}", "ERROR")
+        log_message("Try running as administrator or use --install-dir to specify a different location", "ERROR")
+        return 1
+    except Exception as e:
+        log_message(f"Unexpected error: {e}", "ERROR")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
